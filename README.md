@@ -6,7 +6,7 @@
 
 | | |
 |---|---|
-| 📂 **Первоначальные исходники** | [Original_sources.zip](https://raw.githubusercontent.com/kage-kao/video_tentacles/refs/heads/main/Original_sources.zip) |
+|**Первоначальные исходники**| [Original_sources.zip](https://raw.githubusercontent.com/kage-kao/video_tentacles/refs/heads/main/Original_sources.zip) |
 
 ## ✨ Возможности
 
