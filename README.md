@@ -164,4 +164,4 @@ TEMPSHARE_EZGIF_DURATION = 7   # Дней хранения (ezgif сжатие)
 
 ## 🍄 Разработано:
 
-- **KageKao 👥**
+- **KageKao 👤**
