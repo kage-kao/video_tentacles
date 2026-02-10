@@ -2,6 +2,12 @@
 
 Многофункциональный Telegram-бот для работы с видео: склейка, скачивание и сжатие.
 
+>  Бот — результат слияния нескольких моих отдельных ботов в единый продукт.
+
+| | |
+|---|---|
+| 📂 **Первоначальные исходники** | [Original_sources.zip](https://raw.githubusercontent.com/kage-kao/video_tentacles/refs/heads/main/Original_sources.zip) |
+
 ## ✨ Возможности
 
 ### 🎬 Склейка видео
@@ -37,7 +43,7 @@
 
 1. **Клонируйте репозиторий:**
 ```bash
-git clone https://github.com/kage-kao/video_tentacles.git
+git clone https://github.com/yourusername/tentacles_bot.git
 cd tentacles_bot
 ```
 
@@ -45,6 +51,8 @@ cd tentacles_bot
 ```bash
 python -m venv venv
 source venv/bin/activate  # Linux/macOS
+# или
+venv\Scripts\activate  # Windows
 ```
 
 3. **Установите зависимости:**
@@ -155,4 +163,5 @@ TEMPSHARE_EZGIF_DURATION = 7   # Дней хранения (ezgif сжатие)
 - **MIT License**
 
 ## 🤝 Разработано:
-- **KageKao 👥**
+
+- **KageKao**
