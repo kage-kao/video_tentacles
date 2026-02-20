@@ -5,7 +5,9 @@ Tentacles Bot - Многофункциональный Telegram бот для р
 Вариант 2: ezgif.com — облачное сжатие с выбором разрешения/битрейта/формата
 """
 import asyncio
+import json
 import logging
+import math
 import os
 import tempfile
 import uuid
@@ -71,6 +73,7 @@ DOWNLOAD_CHUNK_SIZE = 256 * 1024
 
 _job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 active_compress_jobs: Dict[int, dict] = {}
+active_compress_tasks: Dict[int, asyncio.Task] = {}
 
 # ===================== EZGIF CONFIGURATION =====================
 
@@ -152,6 +155,12 @@ def format_expires(expires_str: str) -> str:
 
 def is_url(text: str) -> bool:
     return text.startswith("http://") or text.startswith("https://")
+
+
+def _fmt_time(seconds: float) -> str:
+    m = int(seconds // 60)
+    s = int(seconds % 60)
+    return f"{m} мин {s} сек" if m > 0 else f"{s} сек"
 
 
 # ===================== MERGE (СКЛЕЙКА) =====================
@@ -788,6 +797,12 @@ async def cmd_watermark(message: Message, state: FSMContext):
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    # Cancel running compression task if any
+    task = active_compress_tasks.pop(user_id, None)
+    if task and not task.done():
+        task.cancel()
+    active_compress_jobs.pop(user_id, None)
     await state.clear()
     await message.answer("❌ Операция отменена", reply_markup=get_main_keyboard())
 
@@ -1154,7 +1169,8 @@ async def cmd_compress(update: Message | CallbackQuery, state: FSMContext):
                         codec = "av1"
                 
                 await state.update_data(compress_url=url, compress_size=target_mb, compress_codec=codec)
-                await _start_compression(message, state, user_id)
+                task = asyncio.create_task(_start_compression(message, state, user_id))
+                active_compress_tasks[user_id] = task
                 return
             except ValueError:
                 pass
@@ -1312,7 +1328,8 @@ async def compress_codec_callback(callback: CallbackQuery, state: FSMContext):
         f"Цель: {state_data.get('compress_size')} МБ | Кодек: {codec_names.get(codec)}"
     )
     
-    await _start_compression(callback.message, state, user_id)
+    task = asyncio.create_task(_start_compression(callback.message, state, user_id))
+    active_compress_tasks[user_id] = task
 
 
 async def _start_compression(message: Message, state: FSMContext, user_id: int):
@@ -1493,6 +1510,7 @@ async def _start_compression(message: Message, state: FSMContext, user_id: int):
             pass
     finally:
         active_compress_jobs.pop(user_id, None)
+        active_compress_tasks.pop(user_id, None)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
@@ -1615,129 +1633,355 @@ async def ezgif_on_bitrate(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+EZGIF_CHUNK_MB = 190  # Split threshold and chunk size (keep under 200MB limit)
+
+
+async def download_video_for_chunks(url: str, output_path: str, status_msg, settings_text: str) -> int:
+    """Download video to local file with progress, return file size."""
+    timeout = httpx.Timeout(900.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as http:
+        async with http.stream("GET", url) as response:
+            if response.status_code != 200:
+                raise RuntimeError(f"HTTP {response.status_code}")
+            total_size = int(response.headers.get("content-length", 0))
+            downloaded = 0
+            last_update = time.time()
+            with open(output_path, "wb") as f:
+                async for chunk in response.aiter_bytes(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    now = time.time()
+                    if now - last_update > 3 and total_size > 0:
+                        pct = (downloaded / total_size) * 100
+                        try:
+                            await status_msg.edit_text(
+                                f"{settings_text}\n\n⏳ Скачиваю видео: {pct:.0f}%\n"
+                                f"{format_size(downloaded)} / {format_size(total_size)}",
+                                parse_mode=ParseMode.HTML,
+                            )
+                        except Exception:
+                            pass
+                        last_update = now
+    return os.path.getsize(output_path)
+
+
+async def split_video_into_chunks(input_path: str, chunk_size_mb: float, temp_dir: str) -> List[str]:
+    """Split video into chunks of ~chunk_size_mb MB each by time proportion."""
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_format", "-show_streams", input_path,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    stdout, _ = await proc.communicate()
+    info = json.loads(stdout.decode())
+    duration = float(info["format"]["duration"])
+    file_size = os.path.getsize(input_path)
+
+    num_chunks = math.ceil(file_size / (chunk_size_mb * 1024 * 1024))
+    if num_chunks <= 1:
+        return [input_path]
+
+    chunk_duration = duration / num_chunks
+    chunks = []
+    for i in range(num_chunks):
+        start = i * chunk_duration
+        chunk_path = os.path.join(temp_dir, f"chunk_{i:03d}.mp4")
+        cmd = [
+            "ffmpeg", "-y", "-ss", str(start), "-i", input_path,
+            "-t", str(chunk_duration),
+            "-c", "copy", "-avoid_negative_ts", "1",
+            "-movflags", "+faststart", chunk_path,
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        await proc.communicate()
+        if os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 0:
+            chunks.append(chunk_path)
+    return chunks
+
+
+def _process_chunk_sync(chunk_path: str, resolution: str, bitrate: int, fmt: str) -> str:
+    """Upload chunk to tempshare → compress via ezgif → return compressed local path."""
+    # Upload chunk to tempshare to get a URL for ezgif
+    with open(chunk_path, "rb") as f:
+        resp = requests.post(
+            TEMPSHARE_UPLOAD_URL,
+            files={"file": (os.path.basename(chunk_path), f)},
+            data={"duration": "1"},
+            timeout=300,
+        )
+    resp.raise_for_status()
+    result = resp.json()
+    if not result.get("success"):
+        raise RuntimeError(f"Tempshare upload failed: {result}")
+    chunk_url = result["raw_url"]
+
+    # Run ezgif pipeline
+    upload_result = ezgif_step1_upload_url(chunk_url)
+    compress_result = ezgif_step2_compress(
+        file_id=upload_result["file_id"],
+        action_url=upload_result["action_url"],
+        session=upload_result["session"],
+        resolution=resolution,
+        bitrate=bitrate,
+        output_format=fmt,
+    )
+    compressed_path = ezgif_step3_download(
+        save_url=compress_result["save_url"],
+        session=compress_result["session"],
+    )
+    return compressed_path
+
+
+async def concat_video_chunks(chunk_paths: List[str], output_path: str):
+    """Concatenate compressed chunks into one file using ffmpeg."""
+    list_file = output_path + ".list.txt"
+    with open(list_file, "w") as f:
+        for p in chunk_paths:
+            f.write(f"file '{p}'\n")
+    cmd = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", list_file, "-c", "copy",
+        "-movflags", "+faststart", output_path,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    _, stderr = await proc.communicate()
+    try:
+        os.remove(list_file)
+    except OSError:
+        pass
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg concat failed: {stderr.decode()[:300]}")
+
+
 @router.callback_query(F.data.startswith("ezfmt:"))
 async def ezgif_on_format(callback: CallbackQuery, state: FSMContext):
     chat_id = callback.message.chat.id
     fmt = callback.data.split(":", 1)[1]
-    
+
     if chat_id not in ezgif_pending:
         await callback.answer("Сначала отправь ссылку на видео.", show_alert=True)
         return
-    
+
     data = ezgif_pending.pop(chat_id)
     await state.clear()
-    
+
     video_url = data["url"]
     resolution = data["resolution"] or "original"
     bitrate = int(data["bitrate"] or 500)
     res_label = RESOLUTIONS.get(resolution, resolution)
     br_label = BITRATES.get(str(bitrate), f"{bitrate} kbps")
     fmt_label = EZGIF_FORMATS.get(fmt, fmt.upper())
-    
+    settings_text = (
+        f"<b>☁️ ezgif.com — Сжатие</b>\n"
+        f"Настройки: {res_label} / {br_label} / {fmt_label}"
+    )
+
     status_msg = await callback.message.edit_text(
-        f"<b>☁️ ezgif.com — Сжатие</b>\n\n"
-        f"Настройки:\n"
-        f"  Разрешение: <b>{res_label}</b>\n"
-        f"  Битрейт: <b>{br_label}</b>\n"
-        f"  Формат: <b>{fmt_label}</b>\n\n"
-        f"Шаг 1/4: Загрузка видео на ezgif.com...",
+        f"{settings_text}\n\n⏳ Проверяю размер видео...",
         parse_mode=ParseMode.HTML,
     )
     await callback.answer()
-    
+
     loop = asyncio.get_event_loop()
     start_time = time.monotonic()
-    
+    tmpdir = tempfile.mkdtemp(prefix="tentacles_ezgif_")
+
     try:
-        # Step 1
-        upload_result = await loop.run_in_executor(ezgif_executor, ezgif_step1_upload_url, video_url)
-        t1 = time.monotonic() - start_time
+        # ── Проверяем размер через HEAD-запрос ──────────────────────────
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as http:
+            head = await http.head(video_url)
+            content_length = int(head.headers.get("content-length", 0))
+
+        file_size_mb = content_length / (1024 * 1024)
+        needs_chunking = file_size_mb > EZGIF_CHUNK_MB
+
+        # ═══════════════════════════════════════════════════════════════
+        # РЕЖИМ БЕЗ ЧАНКОВ: файл <= 190 МБ — стандартный поток
+        # ═══════════════════════════════════════════════════════════════
+        if not needs_chunking:
+            await status_msg.edit_text(
+                f"{settings_text}\n\nШаг 1/4: Загрузка видео на ezgif.com...",
+                parse_mode=ParseMode.HTML,
+            )
+
+            upload_result = await loop.run_in_executor(ezgif_executor, ezgif_step1_upload_url, video_url)
+            t1 = time.monotonic() - start_time
+            await status_msg.edit_text(
+                f"{settings_text}\n\nШаг 2/4: Сжатие видео...\n(Шаг 1 занял {t1:.1f}с)",
+                parse_mode=ParseMode.HTML,
+            )
+
+            compress_result = await loop.run_in_executor(
+                ezgif_executor,
+                lambda: ezgif_step2_compress(
+                    file_id=upload_result["file_id"],
+                    action_url=upload_result["action_url"],
+                    session=upload_result["session"],
+                    resolution=resolution,
+                    bitrate=bitrate,
+                    output_format=fmt,
+                ),
+            )
+            t2 = time.monotonic() - start_time
+            await status_msg.edit_text(
+                f"{settings_text}\n\nШаг 3/4: Скачивание сжатого видео...\n"
+                f"{compress_result['file_info'][:200]}\n(Сжатие: {t2 - t1:.1f}с)",
+                parse_mode=ParseMode.HTML,
+            )
+
+            tmp_path = await loop.run_in_executor(
+                ezgif_executor,
+                lambda: ezgif_step3_download(
+                    save_url=compress_result["save_url"],
+                    session=compress_result["session"],
+                ),
+            )
+            t3 = time.monotonic() - start_time
+            await status_msg.edit_text(
+                f"{settings_text}\n\nШаг 4/4: Загрузка на tempshare.su...\n(Скачивание: {t3 - t2:.1f}с)",
+                parse_mode=ParseMode.HTML,
+            )
+
+            tempshare_result = await loop.run_in_executor(
+                ezgif_executor,
+                lambda: ezgif_step4_upload_tempshare(tmp_path),
+            )
+            total_time = time.monotonic() - start_time
+
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+            raw_url = tempshare_result.get("raw_url", tempshare_result.get("url", "N/A"))
+            expires = tempshare_result.get("expires", "N/A")
+            t_str = _fmt_time(total_time)
+            keyboard = [[InlineKeyboardButton(text="📦 Сжать ещё", callback_data="menu_compress")]]
+            await status_msg.edit_text(
+                f"<b>✅ Готово! (ezgif.com)</b>\n\n"
+                f"Настройки: {res_label} / {br_label} / {fmt_label}\n"
+                f"Инфо: {compress_result['file_info'][:200]}\n\n"
+                f"Время: <b>{t_str}</b>\n\n"
+                f"<b>Ссылка:</b>\n<code>{raw_url}</code>\n\n"
+                f"Действительна до: {expires}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+            )
+            return
+
+        # ═══════════════════════════════════════════════════════════════
+        # РЕЖИМ ЧАНКОВ: файл > 190 МБ
+        # ═══════════════════════════════════════════════════════════════
+        num_chunks_est = math.ceil(file_size_mb / EZGIF_CHUNK_MB)
         await status_msg.edit_text(
-            f"<b>☁️ ezgif.com</b>\n"
-            f"Настройки: {res_label} / {br_label} / {fmt_label}\n\n"
-            f"Шаг 2/4: Сжатие видео...\n"
-            f"(Шаг 1 занял {t1:.1f} сек)",
+            f"{settings_text}\n\n"
+            f"Видео {file_size_mb:.0f} МБ > {EZGIF_CHUNK_MB} МБ\n"
+            f"Буду делить на ~{num_chunks_est} частей и сжимать каждую.\n\n"
+            f"⏳ Скачиваю видео...",
             parse_mode=ParseMode.HTML,
         )
-        
-        # Step 2
-        compress_result = await loop.run_in_executor(
-            ezgif_executor,
-            lambda: ezgif_step2_compress(
-                file_id=upload_result["file_id"],
-                action_url=upload_result["action_url"],
-                session=upload_result["session"],
-                resolution=resolution,
-                bitrate=bitrate,
-                output_format=fmt,
-            ),
-        )
-        t2 = time.monotonic() - start_time
+
+        # 1. Скачать видео локально
+        input_path = os.path.join(tmpdir, "input_video.mp4")
+        await download_video_for_chunks(video_url, input_path, status_msg, settings_text)
+
+        actual_size_mb = os.path.getsize(input_path) / (1024 * 1024)
         await status_msg.edit_text(
-            f"<b>☁️ ezgif.com</b>\n"
-            f"Настройки: {res_label} / {br_label} / {fmt_label}\n\n"
-            f"Шаг 3/4: Скачивание сжатого видео...\n"
-            f"{compress_result['file_info'][:200]}\n"
-            f"(Сжатие заняло {t2 - t1:.1f} сек)",
+            f"{settings_text}\n\n"
+            f"✅ Скачано: {actual_size_mb:.1f} МБ\n"
+            f"⏳ Нарезаю на части по {EZGIF_CHUNK_MB} МБ...",
             parse_mode=ParseMode.HTML,
         )
-        
-        # Step 3
-        tmp_path = await loop.run_in_executor(
-            ezgif_executor,
-            lambda: ezgif_step3_download(
-                save_url=compress_result["save_url"],
-                session=compress_result["session"],
-            ),
-        )
-        t3 = time.monotonic() - start_time
-        
+
+        # 2. Нарезать на чанки
+        chunks_dir = os.path.join(tmpdir, "chunks")
+        os.makedirs(chunks_dir, exist_ok=True)
+        chunk_paths = await split_video_into_chunks(input_path, EZGIF_CHUNK_MB, chunks_dir)
+        num_chunks = len(chunk_paths)
+
         await status_msg.edit_text(
-            f"<b>☁️ ezgif.com</b>\n"
-            f"Настройки: {res_label} / {br_label} / {fmt_label}\n\n"
-            f"Шаг 4/4: Загрузка на tempshare.su...\n"
-            f"(Скачивание заняло {t3 - t2:.1f} сек)",
+            f"{settings_text}\n\n"
+            f"✅ Нарезано {num_chunks} частей\n"
+            f"⏳ Начинаю сжатие через ezgif.com...",
             parse_mode=ParseMode.HTML,
         )
-        
-        # Step 4
+
+        # 3. Сжать каждый чанк через ezgif
+        compressed_paths = []
+        for idx, chunk_path in enumerate(chunk_paths, 1):
+            chunk_mb = os.path.getsize(chunk_path) / (1024 * 1024)
+            await status_msg.edit_text(
+                f"{settings_text}\n\n"
+                f"Часть {idx}/{num_chunks} ({chunk_mb:.1f} МБ)\n"
+                f"⏳ Загружаю на ezgif.com...",
+                parse_mode=ParseMode.HTML,
+            )
+
+            compressed_path = await loop.run_in_executor(
+                ezgif_executor,
+                lambda cp=chunk_path: _process_chunk_sync(cp, resolution, bitrate, fmt),
+            )
+            compressed_paths.append(compressed_path)
+
+            comp_mb = os.path.getsize(compressed_path) / (1024 * 1024)
+            elapsed = time.monotonic() - start_time
+            await status_msg.edit_text(
+                f"{settings_text}\n\n"
+                f"✅ Часть {idx}/{num_chunks} сжата → {comp_mb:.1f} МБ\n"
+                f"Прошло: {_fmt_time(elapsed)}",
+                parse_mode=ParseMode.HTML,
+            )
+
+        # 4. Склеить все сжатые чанки
+        await status_msg.edit_text(
+            f"{settings_text}\n\n"
+            f"✅ Все {num_chunks} частей сжаты\n"
+            f"⏳ Склеиваю в одно видео...",
+            parse_mode=ParseMode.HTML,
+        )
+
+        final_path = os.path.join(tmpdir, f"final.{fmt}")
+        if len(compressed_paths) == 1:
+            final_path = compressed_paths[0]
+        else:
+            await concat_video_chunks(compressed_paths, final_path)
+
+        final_mb = os.path.getsize(final_path) / (1024 * 1024)
+        await status_msg.edit_text(
+            f"{settings_text}\n\n"
+            f"✅ Готово: {final_mb:.1f} МБ\n"
+            f"⏳ Загружаю на tempshare.su...",
+            parse_mode=ParseMode.HTML,
+        )
+
+        # 5. Загрузить на tempshare
         tempshare_result = await loop.run_in_executor(
             ezgif_executor,
-            lambda: ezgif_step4_upload_tempshare(tmp_path),
+            lambda: ezgif_step4_upload_tempshare(final_path),
         )
         total_time = time.monotonic() - start_time
-        
+
         raw_url = tempshare_result.get("raw_url", tempshare_result.get("url", "N/A"))
         expires = tempshare_result.get("expires", "N/A")
-        
-        minutes = int(total_time // 60)
-        seconds = int(total_time % 60)
-        if minutes > 0:
-            time_str = f"{minutes} мин {seconds} сек"
-        else:
-            time_str = f"{seconds} сек"
-        
         keyboard = [[InlineKeyboardButton(text="📦 Сжать ещё", callback_data="menu_compress")]]
         await status_msg.edit_text(
-            f"<b>✅ Готово! (ezgif.com)</b>\n\n"
+            f"<b>✅ Готово! (ezgif.com, {num_chunks} частей)</b>\n\n"
             f"Настройки: {res_label} / {br_label} / {fmt_label}\n"
-            f"Инфо: {compress_result['file_info'][:200]}\n\n"
-            f"Время обработки: <b>{time_str}</b>\n"
-            f"  — Загрузка на ezgif: {t1:.1f}с\n"
-            f"  — Сжатие: {t2 - t1:.1f}с\n"
-            f"  — Скачивание: {t3 - t2:.1f}с\n"
-            f"  — Загрузка на tempshare: {total_time - t3:.1f}с\n\n"
+            f"Оригинал: {actual_size_mb:.1f} МБ → Результат: {final_mb:.1f} МБ\n"
+            f"Частей: {num_chunks}\n"
+            f"Время: <b>{_fmt_time(total_time)}</b>\n\n"
             f"<b>Ссылка:</b>\n<code>{raw_url}</code>\n\n"
             f"Действительна до: {expires}",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
         )
-        
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-    
+
     except Exception as e:
         total_time = time.monotonic() - start_time
         logger.error(f"ezgif error: {e}", exc_info=True)
@@ -1747,6 +1991,8 @@ async def ezgif_on_format(callback: CallbackQuery, state: FSMContext):
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
         )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ===================== STATUS =====================
