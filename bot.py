@@ -230,7 +230,8 @@ async def run_ffmpeg(cmd: list, description: str = "ffmpeg") -> tuple:
         if process.returncode != 0:
             error_msg = stderr.decode(errors='replace')
             logger.error(f"{description} failed (rc={process.returncode}): {error_msg}")
-            raise RuntimeError(f"{description} failed: {error_msg[:500]}")
+            # Skip ffmpeg version/config header, show only last 800 chars (actual error)
+            raise RuntimeError(f"{description} failed: {error_msg[-800:]}")
         return stdout, stderr
 
 
@@ -298,6 +299,8 @@ async def normalize_single_video(i: int, video_path: str, temp_dir: str) -> str:
         'ffmpeg', '-y',
         '-threads', FFMPEG_THREADS,
         '-i', video_path,
+        '-map', '0:v:0',
+        '-map', '0:a:0?',          # ? — аудио опционально (видео без звука не падает)
         '-c:v', 'libx264', '-preset', 'ultrafast',
         '-c:a', 'aac', '-ar', '44100', '-ac', '2',
         '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1',
@@ -955,6 +958,21 @@ async def cmd_merge_now(message: Message):
         await status_msg.edit_text(f"❌ Ошибка: {str(e)}")
 
 
+async def is_valid_video(file_path: str) -> bool:
+    """Check video integrity via ffprobe — catches moov atom missing, corrupted files, etc."""
+    cmd = [
+        'ffprobe', '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=codec_type',
+        '-of', 'csv=p=0', file_path
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    stdout, _ = await proc.communicate()
+    return proc.returncode == 0 and b'video' in stdout
+
+
 @router.message(F.video)
 async def handle_video(message: Message, state: FSMContext):
     current_state = await state.get_state()
@@ -986,6 +1004,15 @@ async def handle_video(message: Message, state: FSMContext):
         video_path = os.path.join(data.temp_dir, video_filename)
         
         await bot.download_file(file.file_path, video_path)
+
+        if not await is_valid_video(video_path):
+            os.remove(video_path)
+            await message.answer(
+                "⚠️ Видео повреждено или скачалось неполностью.\n"
+                "Попробуйте отправить ещё раз."
+            )
+            return
+
         data.videos.append(video_path)
         
         await message.answer(
@@ -1045,6 +1072,15 @@ async def handle_document(message: Message, state: FSMContext):
         video_path = os.path.join(data.temp_dir, video_filename)
         
         await bot.download_file(file.file_path, video_path)
+
+        if not await is_valid_video(video_path):
+            os.remove(video_path)
+            await message.answer(
+                "⚠️ Файл повреждён или скачался неполностью.\n"
+                "Попробуйте отправить ещё раз."
+            )
+            return
+
         data.videos.append(video_path)
         
         await message.answer(
